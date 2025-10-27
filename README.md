@@ -1,1 +1,2 @@
 # Caso02_Prediccion_BBVA_SANTANDER
+n_lags
