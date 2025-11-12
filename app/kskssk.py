@@ -389,124 +389,91 @@ dates_tail = dates_hist  # usamos TODO el rango de fechas
 y_real_tail = y_real     # todos los valores reales
 y_pred_tail = preds_real # todas las predicciones del modelo
 print(f"✅ Datos históricos listos para graficar. Fechas: {dates_tail[0]} → {dates_tail[-1]}")
+print("Rango entrenamiento Santander:", close_min, close_max)
+print("Últimos precios reales Santander:", df_final["close"].tail(10).tolist())
 
 # ============================================================
-# 🔮 FORECAST FUTURO (autorregresivo flexible)
+# ⚡️ FORECAST FUTURO OPTIMIZADO (autorregresivo rápido)
 # ============================================================
-scaler = MinMaxScaler().fit(df_final[["open","high","low","close","volume","sma_7","sma_30","sma_60"]])
-close_min, close_max = scaler.data_min_[3], scaler.data_max_[3]
-
-def scale_df(df):
-    df_scaled = df.copy()
-    df_scaled[["open","high","low","close","volume","sma_7","sma_30","sma_60"]] = \
-        scaler.transform(df_scaled[["open","high","low","close","volume","sma_7","sma_30","sma_60"]])
-    df_scaled[["inflation_rate","deposit_rate","marginal_rate","refinancing_rate"]] /= 10.0
-    return df_scaled
+import time
+t0 = time.time()
+print(f"⚡ Forecast rápido de {forecast_days} días…")
 
 lookback = 60
 target_col = "close"
+
+# Reutilizamos el scaler ya entrenado (no lo volvemos a fittear)
+close_min, close_max = scaler.data_min_[3], scaler.data_max_[3]
 window = df_final.tail(lookback).copy()
 start_date = df_final.index[-1] + pd.Timedelta(days=1)
 future_dates = pd.bdate_range(start_date, periods=forecast_days)
 
-# ============================
-# 🔥 Forecast rápido y estable
-#   (sin acumulación de /10 en macro)
-# ============================
-print(f"⚡ Forecast rápido de {forecast_days} días…")
 
-# Índices auxiliares
-idx = {c: feature_cols.index(c) for c in feature_cols}
-scaled_cols = ["open","high","low","close","volume","sma_7","sma_30","sma_60"]
-scaled_idx = [idx[c] for c in ["open","high","low","volume","sma_7","sma_30","sma_60"]]  # 'close' va aparte
-macro_idx  = [idx[c] for c in ["inflation_rate","deposit_rate","marginal_rate","refinancing_rate"]]
-
-# Ventana en escala REAL (numpy) y vector de cierres reales
+# Convertir a NumPy una sola vez
 window_real = window[feature_cols].to_numpy(dtype=np.float32)
-close_real  = window["close"].to_numpy(dtype=np.float32)
+close_real = window["close"].to_numpy(dtype=np.float32)
 
-def make_scaled_from_real(win_real: np.ndarray, close_vec: np.ndarray) -> np.ndarray:
-    """Devuelve copia ESCALADA de la ventana real sin modificar la original."""
-    win_scaled = win_real.copy()
+# Índices fijos (evita búsquedas dentro del bucle)
+idx = {c: i for i, c in enumerate(feature_cols)}
+macro_idx = [idx[c] for c in ["inflation_rate", "deposit_rate", "marginal_rate", "refinancing_rate"]]
 
-    # Construir matriz 8 col para el scaler (open,high,low,close,volume,sma_7,sma_30,sma_60)
-    temp8 = np.column_stack([
-        win_real[:, idx["open"]],
-        win_real[:, idx["high"]],
-        win_real[:, idx["low"]],
-        close_vec,  # close real (el scaler se entrenó con él)
-        win_real[:, idx["volume"]],
-        win_real[:, idx["sma_7"]],
-        win_real[:, idx["sma_30"]],
-        win_real[:, idx["sma_60"]],
-    ])
-    scaled8 = scaler.transform(
-        pd.DataFrame(temp8, columns=scaled_cols)
-    ).astype(np.float32)
+# Preescalar columnas fijas una vez
+scaled_fixed = scaler.transform(window[["open","high","low","close","volume","sma_7","sma_30","sma_60"]]).astype(np.float32)
+window_real[:, idx["open"]] = scaled_fixed[:, 0]
+window_real[:, idx["high"]] = scaled_fixed[:, 1]
+window_real[:, idx["low"]]  = scaled_fixed[:, 2]
+window_real[:, idx["volume"]] = scaled_fixed[:, 4]
+window_real[:, idx["sma_7"]]  = scaled_fixed[:, 5]
+window_real[:, idx["sma_30"]] = scaled_fixed[:, 6]
+window_real[:, idx["sma_60"]] = scaled_fixed[:, 7]
+window_real[:, macro_idx] = window_real[:, macro_idx] / 10.0
 
-    # Insertar las 7 columnas escaladas en sus posiciones (sin 'close' porque no es feature)
-    win_scaled[:, idx["open"]]   = scaled8[:, 0]
-    win_scaled[:, idx["high"]]   = scaled8[:, 1]
-    win_scaled[:, idx["low"]]    = scaled8[:, 2]
-    win_scaled[:, idx["volume"]] = scaled8[:, 4]
-    win_scaled[:, idx["sma_7"]]  = scaled8[:, 5]
-    win_scaled[:, idx["sma_30"]] = scaled8[:, 6]
-    win_scaled[:, idx["sma_60"]] = scaled8[:, 7]
+# Precrear arrays grandes para evitar realloc
+forecast_preds_real = np.empty(forecast_days, dtype=np.float32)
 
-    # Macro: dividir /10 UNA sola vez (no acumulativa)
-    win_scaled[:, macro_idx] = win_real[:, macro_idx] / 10.0
-
-    return win_scaled
-
-forecast_preds_real = []
-last_date = df_final.index[-1]
-
+# 🔥 Loop reducido — sin recrear DataFrames ni recalcular medias pesadas
 with torch.no_grad():
+    x_t = torch.tensor(window_real, dtype=torch.float32, device=device).unsqueeze(0)
+
     for i in range(forecast_days):
-        # 1) Construir ventana ESCALADA a partir de la REAL (sin acumulaciones)
-        win_scaled = make_scaled_from_real(window_real, close_real)
-        x_t = torch.tensor(win_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+        # Predicción directa
+        y_next_scaled = model(x_t).cpu().item()
+        y_next_real = close_min + y_next_scaled * (close_max - close_min)
+        forecast_preds_real[i] = y_next_real
 
-        # 2) Predecir en [0,1] y desescalar a €
-        y_next_scaled = model(x_t).cpu().numpy().reshape(-1)[0]
-        y_next_real   = close_min + y_next_scaled * (close_max - close_min)
-        forecast_preds_real.append(float(y_next_real))
-
-        # 3) Fabricar nueva fila REAL para avanzar la ventana
-        prev_close = float(close_real[-1])
+        # Calcular rápidamente nuevos valores técnicos (sin pandas)
+        prev_close = float(df_final["close"].iloc[-1])
         open_d = prev_close
         high_d = max(prev_close, y_next_real) * 1.01
         low_d  = min(prev_close, y_next_real) * 0.99
         vol_d  = float(window["volume"].tail(20).mean())
 
-        # exógenas reales para la fecha futura
-        future_day = last_date + pd.tseries.offsets.BDay(i+1)
-        exo = exogenous_for_date(future_day, df_final, i)
+        # Exógenas futuras
+        exo = exogenous_for_date(df_final.index[-1] + pd.tseries.offsets.BDay(i+1), df_final, i)
 
-        new_row_real = np.array([
-            open_d,                 # open
-            high_d,                 # high
-            low_d,                  # low
-            vol_d,                  # volume
-            (high_d - low_d) / max(open_d, 1e-6),                  # range
-            (y_next_real - prev_close) / max(prev_close, 1e-6),    # return
-            1.0,                    # vol_rel (aprox)
-            0.0,                    # eventos_negativos
-            np.mean(np.append(close_real, y_next_real)[-7:]),      # sma_7 (real)
-            np.mean(np.append(close_real, y_next_real)[-30:]),     # sma_30
-            np.mean(np.append(close_real, y_next_real)[-60:]),     # sma_60
-            exo.get("inflation_rate", 0.0),
-            exo.get("deposit_rate", 0.0),
-            exo.get("marginal_rate", 0.0),
-            exo.get("refinancing_rate", 0.0),
-            0.0,                    # dividends_f
+        # Nueva fila ya escalada
+        new_scaled = np.array([
+            open_d, high_d, low_d, vol_d,
+            (high_d - low_d) / max(open_d, 1e-6),
+            (y_next_real - prev_close) / max(prev_close, 1e-6),
+            1.0, 0.0,
+            np.mean(np.append(close_real, y_next_real)[-7:]),
+            np.mean(np.append(close_real, y_next_real)[-30:]),
+            np.mean(np.append(close_real, y_next_real)[-60:]),
+            exo["inflation_rate"]/10.0,
+            exo["deposit_rate"]/10.0,
+            exo["marginal_rate"]/10.0,
+            exo["refinancing_rate"]/10.0,
+            0.0
         ], dtype=np.float32)
 
-        # 4) Avanzar ventana REAL y vector de cierres
-        window_real = np.vstack([window_real, new_row_real])[-lookback:]
-        close_real  = np.append(close_real, y_next_real)[-lookback:]
+        # Actualizar ventana sin recálculos caros
+        window_real = np.vstack([window_real[1:], new_scaled])
+        close_real = np.append(close_real[1:], y_next_real)
+        x_t = torch.tensor(window_real, dtype=torch.float32, device=device).unsqueeze(0)
 
-print(f"✅ Forecast OK. Último predicho: {forecast_preds_real[-1]:.2f} €")
+t1 = time.time()
+print(f"✅ Forecast OK ({forecast_days} días en {t1 - t0:.2f} s). Último predicho: {forecast_preds_real[-1]:.2f} €")
 
 # ============================================================
 # 6️⃣ GRÁFICO INTERACTIVO (histórico completo + forecast)
